@@ -512,6 +512,206 @@ systemctl restart chronyd
 
 ---
 
+## 7. Log Rotation with logrotate
+
+### What logrotate Does
+
+`logrotate` prevents log files in `/var/log/` from growing indefinitely and filling the filesystem. It renames old log files with a date-stamped suffix, optionally compresses them, and removes logs older than a configured retention period.
+
+```
+/var/log/messages          (current, being written to)
+/var/log/messages-20250620 (rotated last week, compressed)
+/var/log/messages-20250613 (two weeks ago)
+/var/log/messages-20250606 (three weeks ago)
+/var/log/messages-20250530 (four weeks ago - next rotation drops this)
+```
+
+> By default on RHEL, most log files are rotated weekly and kept for four weeks (four rotations). After the fifth rotation, the oldest file is discarded.
+
+### How logrotate Is Triggered
+
+logrotate is driven by a systemd timer - it is not a daemon or cron job itself:
+
+```bash
+# Check the logrotate timer status and next scheduled run
+systemctl status logrotate.timer
+
+# The timer triggers logrotate.service once per day
+# logrotate itself decides whether each file needs rotating
+# (based on the schedule in its config)
+```
+
+### Configuration File Locations
+
+| Location | Purpose |
+|---|---|
+| `/etc/logrotate.conf` | Global defaults - applies to all log files |
+| `/etc/logrotate.d/*.conf` | Per-application overrides - packages install files here |
+
+> Files in `/etc/logrotate.d/` are read by `/etc/logrotate.conf` via an `include` directive. Package-specific rotation rules (httpd, sshd, dnf, etc.) live here.
+
+### `/etc/logrotate.conf` - Global Defaults
+
+```bash
+# View the main config
+cat /etc/logrotate.conf
+```
+
+```bash
+# Typical /etc/logrotate.conf contents
+
+weekly              # Rotate weekly by default
+rotate 4            # Keep 4 rotated copies (4 weeks of history)
+create              # Create a new empty log file after rotation
+dateext             # Use date as suffix (e.g. messages-20250620) instead of .1 .2 .3
+compress            # Compress rotated files with gzip
+
+# Include per-application config files
+include /etc/logrotate.d
+```
+
+### Key logrotate Directives
+
+| Directive | Meaning |
+|---|---|
+| `daily` | Rotate every day |
+| `weekly` | Rotate every week (default for most logs) |
+| `monthly` | Rotate every month |
+| `rotate N` | Keep N old copies before deleting the oldest |
+| `size N` | Rotate when file reaches size N (e.g. `size 100M`, `size 1G`) |
+| `maxsize N` | Rotate if file exceeds N, even if schedule hasn't triggered |
+| `minsize N` | Only rotate if file is at least N in size |
+| `compress` | Compress rotated files with gzip (`.gz`) |
+| `delaycompress` | Compress the previous rotation, not the one just rotated |
+| `dateext` | Use date stamp in rotated filename instead of numbers |
+| `dateformat -%Y%m%d` | Format for the date stamp |
+| `create MODE UID GID` | Create a new empty log file after rotation |
+| `missingok` | Do not error if the log file is missing |
+| `notifempty` | Do not rotate the file if it is empty |
+| `sharedscripts` | Run `postrotate` script once even if multiple files match |
+| `postrotate / endscript` | Run a shell command after rotation (e.g. reload a service) |
+| `prerotate / endscript` | Run a shell command before rotation |
+| `copytruncate` | Copy the log, then truncate the original (for apps that cannot reopen their log file) |
+| `olddir DIR` | Move rotated files to a different directory |
+| `mail ADDRESS` | Email rotated logs to this address when they are about to be deleted |
+
+### Per-Application Config Example
+
+```bash
+# /etc/logrotate.d/syslog  (rsyslog log rotation)
+
+/var/log/cron
+/var/log/messages
+/var/log/secure
+/var/log/spooler
+/var/log/boot.log
+{
+    weekly
+    rotate 4
+    missingok
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl kill -s HUP rsyslog.service 2>/dev/null || true
+    endscript
+}
+```
+
+```bash
+# /etc/logrotate.d/httpd  (Apache log rotation)
+
+/var/log/httpd/*log {
+    daily
+    rotate 52
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /bin/systemctl reload httpd.service > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+### Creating a Custom logrotate Config
+
+```bash
+# Create a config for your application logs
+vim /etc/logrotate.d/myapp
+```
+
+```bash
+# /etc/logrotate.d/myapp
+
+/var/log/myapp/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 myapp myapp
+    dateext
+    dateformat -%Y%m%d
+    sharedscripts
+    postrotate
+        systemctl kill -s HUP myapp.service 2>/dev/null || true
+    endscript
+}
+```
+
+### Testing and Running logrotate Manually
+
+```bash
+# Test config syntax and show what WOULD happen (dry run - no actual rotation)
+logrotate --debug /etc/logrotate.conf
+logrotate --debug /etc/logrotate.d/myapp
+
+# Force rotation NOW (ignores schedule, rotates regardless)
+logrotate --force /etc/logrotate.conf
+logrotate --force /etc/logrotate.d/myapp
+
+# Verbose output showing what is being processed
+logrotate --verbose /etc/logrotate.conf
+
+# Check when logrotate last ran for each file
+cat /var/lib/logrotate/logrotate.status
+```
+
+> **Important:** `--debug` does NOT rotate anything. Use it to validate config before deploying. `--force` rotates immediately regardless of schedule - use with care in production.
+
+### Why `postrotate` Matters
+
+Many services (rsyslog, httpd, nginx) open their log file once at startup and keep it open. When logrotate renames the file, the service keeps writing to the renamed file, not the new one. The `postrotate` script sends a signal (usually `HUP` or `USR1`) to tell the service to close and reopen its log file descriptor.
+
+```bash
+# Without postrotate: service keeps writing to the RENAMED file
+# /var/log/messages-20250620 keeps growing
+# /var/log/messages stays empty
+
+# With postrotate (sending HUP to rsyslog):
+# rsyslog reopens /var/log/messages
+# rotation works correctly
+```
+
+> `copytruncate` is an alternative: logrotate copies the file, then truncates the original to zero bytes. The service never needs to reopen. However, there is a brief window where log entries between the copy and truncate can be lost - use `postrotate` with `HUP` where possible.
+
+### delaycompress Explained
+
+```
+Rotation 1 (this week):
+  messages       -> messages-20250620    (NOT compressed yet - service may still write to it)
+  new messages created
+
+Rotation 2 (next week):
+  messages       -> messages-20250627    (NOT compressed)
+  messages-20250620 -> messages-20250620.gz  (NOW compressed - definitely closed)
+```
+
+> `delaycompress` prevents compressing the most recently rotated file immediately. This is important when `copytruncate` is NOT used, because the service might still briefly write to the just-rotated file before the `postrotate` HUP takes effect.
+
+---
+
 ## Quick Reference: All Commands
 
 ```bash
@@ -544,6 +744,15 @@ journalctl -o verbose                  # All journal fields
 mkdir /var/log/journal                 # Enable persistent storage
 journalctl --flush                     # Flush to new location
 
+# --- logrotate ---
+systemctl status logrotate.timer       # Check timer status and next run
+logrotate --debug /etc/logrotate.conf  # Dry run - shows what would happen
+logrotate --debug /etc/logrotate.d/myapp  # Dry run for one config file
+logrotate --force /etc/logrotate.conf  # Force rotation now
+logrotate --verbose /etc/logrotate.conf   # Verbose output
+cat /var/lib/logrotate/logrotate.status   # Last rotation times per file
+ls /etc/logrotate.d/                   # List per-app rotation configs
+
 # --- time ---
 timedatectl                            # Show current time and NTP status
 timedatectl list-timezones | grep Australia
@@ -566,6 +775,9 @@ systemctl status chronyd
 | `/var/log/journal/` | Persistent journal (create this directory to enable) |
 | `/usr/lib/systemd/journald.conf` | Vendor journal config - do not edit |
 | `/etc/systemd/journald.conf` | Admin journal config - copy from `/usr/lib/` then edit |
+| `/etc/logrotate.conf` | Global logrotate defaults and include directive |
+| `/etc/logrotate.d/*.conf` | Per-application log rotation rules |
+| `/var/lib/logrotate/logrotate.status` | Record of last rotation time per log file |
 | `/etc/chrony.conf` | NTP client configuration |
 | `/var/lib/chrony/drift` | Local clock drift record |
 
@@ -592,3 +804,7 @@ systemctl status chronyd
 9. **Time zones affect log readability, not log accuracy.** The journal always stores timestamps in UTC internally. `timedatectl set-timezone` changes how timestamps are displayed, not the underlying stored value. Set the correct zone so logs match your business hours.
 
 10. **Accurate time is a compliance requirement.** PCI DSS Requirement 10.6 mandates time synchronisation for all system components in scope. IRAP requires it for log integrity. `chronyc tracking` showing a large offset is a finding, not just a configuration note.
+
+11. **logrotate is triggered by `logrotate.timer`, not a cron job (on RHEL 10).** It runs the check daily but only rotates files that meet their schedule criteria. Use `logrotate --debug` to validate a config file before deploying - it shows exactly what would happen without touching anything.
+
+12. **`postrotate` must signal the service to reopen its log file.** Without it, services like rsyslog and httpd keep writing to the renamed/rotated file. The new empty log file stays empty. If you create a custom logrotate config for any service that holds a log file open, always include a `postrotate` block sending `HUP` or `USR1` to the service.
