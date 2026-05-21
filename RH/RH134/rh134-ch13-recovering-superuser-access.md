@@ -177,7 +177,7 @@ bash-5.2# touch /.autorelabel
 ```
 
 ```
-Step 13: Hand off from recovery bash to systemd (DO NOT use 'reboot')
+Step 13: Hand off from recovery bash to systemd (DO NOT use 'reboot' or 'exit')
 ```
 
 ```bash
