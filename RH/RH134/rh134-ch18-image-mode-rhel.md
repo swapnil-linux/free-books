@@ -56,6 +56,7 @@
 │  Write Containerfile with FROM rhel-bootc               │
 │  podman build -t registry/user/myos:latest .            │
 └─────────────────────────┬───────────────────────────────┘
+                         TEST
                           |
                           v
 ┌─────────────────────────────────────────────────────────┐
